@@ -6,7 +6,7 @@ import pytz
 import aiohttp
 from telegram import Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
@@ -19,164 +19,135 @@ TZ_LONDON = pytz.timezone("Europe/London")
 TZ_TOKYO  = pytz.timezone("Asia/Tokyo")
 TZ_UTC    = pytz.utc
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ── Market Sessions ────────────────────────────────────────────────────────────
 MARKETS = {
-    "tokyo": {
-        "name": "🇯🇵 Tokyo (Asia)",
-        "open":  "09:00",
-        "close": "15:30",
-        "tz":    TZ_TOKYO,
-        "flag":  "🌏",
-    },
-    "london": {
-        "name": "🇬🇧 London",
-        "open":  "08:00",
-        "close": "16:30",
-        "tz":    TZ_LONDON,
-        "flag":  "🌍",
-    },
-    "newyork": {
-        "name": "🇺🇸 New York (NYSE/NASDAQ)",
-        "open":  "09:30",
-        "close": "16:00",
-        "tz":    TZ_NY,
-        "flag":  "🌎",
-    },
+    "tokyo":   {"name": "🇯🇵 Tokyo (Asia)",        "open": "09:00", "close": "15:30", "tz": TZ_TOKYO,  "flag": "🌏"},
+    "london":  {"name": "🇬🇧 London",              "open": "08:00", "close": "16:30", "tz": TZ_LONDON, "flag": "🌍"},
+    "newyork": {"name": "🇺🇸 New York (NYSE/NASDAQ)", "open": "09:30", "close": "16:00", "tz": TZ_NY,    "flag": "🌎"},
 }
 
-# Key forex/index symbols to check for bullish/bearish
-SYMBOLS = ["AAPL", "SPY", "QQQ", "EURUSD", "GBPUSD", "USDJPY"]
+# Global bot reference
+_bot: Bot = None
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-async def send_message(bot: Bot, text: str):
+def get_loop():
     try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text,
-            parse_mode="Markdown"
-        )
-        logger.info(f"Sent: {text[:60]}...")
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
+def send(text: str):
+    """Send a message synchronously from the background scheduler."""
+    async def _send():
+        await _bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
+    try:
+        loop = get_loop()
+        loop.run_until_complete(_send())
+        logger.info(f"Sent: {text[:60]}")
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        logger.error(f"Send error: {e}")
 
 
-async def fetch_quote(session: aiohttp.ClientSession, symbol: str) -> dict:
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-    async with session.get(url) as resp:
-        return await resp.json()
+# ── Scheduled Jobs (synchronous — called by BackgroundScheduler) ───────────────
 
-
-async def fetch_news(session: aiohttp.ClientSession) -> list:
-    url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_API_KEY}"
-    async with session.get(url) as resp:
-        data = await resp.json()
-        return data[:5] if isinstance(data, list) else []
-
-
-# ── Scheduled Jobs ─────────────────────────────────────────────────────────────
-
-async def good_morning(bot: Bot):
+def job_good_morning():
     now = datetime.now(TZ_NY)
-    date_str = now.strftime("%A, %B %d %Y")
-    msg = (
+    send(
         f"🌅 *Good Morning — AZZAM & Co Team!*\n\n"
-        f"📅 {date_str}\n\n"
+        f"📅 {now.strftime('%A, %B %d %Y')}\n\n"
         f"Today's market sessions:\n"
         f"🌏 Tokyo:    09:00 – 15:30 JST\n"
         f"🌍 London:   08:00 – 16:30 GMT\n"
         f"🌎 New York: 09:30 – 16:00 EST\n\n"
         f"Stay focused, trade smart. Let's have a great day! 💼📈"
     )
-    await send_message(bot, msg)
 
 
-async def market_open_alert(bot: Bot, market_key: str):
+def job_market_open(market_key: str):
     m = MARKETS[market_key]
-    msg = (
+    send(
         f"{m['flag']} *MARKET OPEN — {m['name']}*\n\n"
         f"🟢 The {m['name']} session has just opened!\n"
         f"🕐 Local time: {datetime.now(m['tz']).strftime('%H:%M %Z')}\n\n"
         f"Watch for early momentum and liquidity. Good luck traders! 📊"
     )
-    await send_message(bot, msg)
 
 
-async def market_close_alert(bot: Bot, market_key: str):
+def job_market_close(market_key: str):
     m = MARKETS[market_key]
-    msg = (
+    send(
         f"{m['flag']} *MARKET CLOSE — {m['name']}*\n\n"
         f"🔴 The {m['name']} session has closed.\n"
         f"🕐 Local time: {datetime.now(m['tz']).strftime('%H:%M %Z')}\n\n"
         f"Review your trades and prepare for the next session. 📋"
     )
-    await send_message(bot, msg)
 
 
-async def bullish_bearish_signal(bot: Bot):
-    try:
+def job_signals():
+    async def _fetch():
+        results = []
         async with aiohttp.ClientSession() as session:
-            results = []
             for symbol in ["SPY", "QQQ", "EURUSD"]:
                 try:
-                    quote = await fetch_quote(session, symbol)
-                    if quote and "c" in quote and "pc" in quote:
-                        current = quote["c"]
-                        prev_close = quote["pc"]
-                        if prev_close and prev_close > 0:
-                            change_pct = ((current - prev_close) / prev_close) * 100
-                            emoji = "📈 BULLISH" if change_pct > 0 else "📉 BEARISH"
-                            arrow = "▲" if change_pct > 0 else "▼"
-                            results.append(
-                                f"• *{symbol}*: {emoji} {arrow} {abs(change_pct):.2f}%"
-                            )
+                    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        q = await r.json()
+                    if q and q.get("c") and q.get("pc"):
+                        pct = ((q["c"] - q["pc"]) / q["pc"]) * 100
+                        emoji = "📈 BULLISH" if pct > 0 else "📉 BEARISH"
+                        arrow = "▲" if pct > 0 else "▼"
+                        results.append(f"• *{symbol}*: {emoji} {arrow} {abs(pct):.2f}%")
                 except Exception:
-                    continue
+                    pass
+        return results
 
-            if results:
-                msg = (
-                    f"📊 *AZZAM & Co — Market Signal Update*\n"
-                    f"🕐 {datetime.now(TZ_NY).strftime('%H:%M EST')}\n\n"
-                    + "\n".join(results)
-                    + "\n\n_Based on latest price vs previous close._"
-                )
-                await send_message(bot, msg)
-    except Exception as e:
-        logger.error(f"Signal error: {e}")
-
-
-async def breaking_news(bot: Bot):
     try:
+        loop = get_loop()
+        results = loop.run_until_complete(_fetch())
+        if results:
+            send(
+                f"📊 *AZZAM & Co — Market Signal Update*\n"
+                f"🕐 {datetime.now(TZ_NY).strftime('%H:%M EST')}\n\n"
+                + "\n".join(results)
+                + "\n\n_Based on latest price vs previous close._"
+            )
+    except Exception as e:
+        logger.error(f"Signals error: {e}")
+
+
+def job_news():
+    async def _fetch():
         async with aiohttp.ClientSession() as session:
-            news = await fetch_news(session)
-            if not news:
-                return
+            url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_API_KEY}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+        return data[:4] if isinstance(data, list) else []
 
+    try:
+        loop = get_loop()
+        news = loop.run_until_complete(_fetch())
+        if news:
             msg = "📰 *AZZAM & Co — Breaking Financial News*\n\n"
-            for item in news[:4]:
-                headline = item.get("headline", "")
-                source = item.get("source", "")
-                url = item.get("url", "")
-                if headline:
-                    msg += f"• {headline}\n  _— {source}_\n\n"
-
-            await send_message(bot, msg)
+            for item in news:
+                h = item.get("headline", "")
+                s = item.get("source", "")
+                if h:
+                    msg += f"• {h}\n  _— {s}_\n\n"
+            send(msg)
     except Exception as e:
         logger.error(f"News error: {e}")
 
 
-async def high_impact_events(bot: Bot):
-    # High impact economic events reminder (static schedule of key weekly events)
-    now = datetime.now(TZ_NY)
-    day = now.strftime("%A")
-
+def job_events():
+    day = datetime.now(TZ_NY).strftime("%A")
     events = {
         "Monday":    "• USD: Fed Member Speeches\n• EUR: Eurozone Sentix Index",
         "Tuesday":   "• USD: Consumer Confidence\n• GBP: UK Claimant Count",
@@ -184,99 +155,92 @@ async def high_impact_events(bot: Bot):
         "Thursday":  "• USD: Initial Jobless Claims\n• EUR: ECB Meeting (if scheduled)",
         "Friday":    "• USD: Non-Farm Payrolls (NFP) 🔥\n• USD: Unemployment Rate",
     }
-
     if day in events:
-        msg = (
+        send(
             f"⚠️ *High Impact Events Today — {day}*\n\n"
             f"{events[day]}\n\n"
             f"_Stay alert — these can cause high volatility!_ 📉📈"
         )
-        await send_message(bot, msg)
 
 
-# ── Bot Commands ───────────────────────────────────────────────────────────────
-async def start(update, context: ContextTypes.DEFAULT_TYPE):
+# ── Telegram Commands ──────────────────────────────────────────────────────────
+
+async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *AZZAM & Co Trading Bot is active!*\n\n"
         "You will receive:\n"
         "🌅 Daily Good Morning at 6:00 AM\n"
         "🟢 Market Open alerts\n"
         "🔴 Market Close alerts\n"
-        "📊 Bullish/Bearish signals\n"
+        "📊 Bullish/Bearish signals every 2hrs\n"
         "📰 Breaking financial news\n"
         "⚠️ High impact event reminders\n\n"
-        "Use /status to check current market sessions.",
+        "Use /status to check current markets.",
         parse_mode="Markdown"
     )
 
 
-async def status(update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
     now_utc = datetime.now(TZ_UTC)
     msg = "📊 *Current Market Status*\n\n"
-
     for key, m in MARKETS.items():
-        local_time = now_utc.astimezone(m["tz"])
-        open_h, open_m = map(int, m["open"].split(":"))
-        close_h, close_m = map(int, m["close"].split(":"))
+        local = now_utc.astimezone(m["tz"])
+        oh, om = map(int, m["open"].split(":"))
+        ch, cm = map(int, m["close"].split(":"))
         is_open = (
-            local_time.weekday() < 5 and
-            (local_time.hour > open_h or (local_time.hour == open_h and local_time.minute >= open_m)) and
-            (local_time.hour < close_h or (local_time.hour == close_h and local_time.minute < close_m))
+            local.weekday() < 5 and
+            (local.hour > oh or (local.hour == oh and local.minute >= om)) and
+            (local.hour < ch or (local.hour == ch and local.minute < cm))
         )
-        status_emoji = "🟢 OPEN" if is_open else "🔴 CLOSED"
-        msg += f"{m['flag']} *{m['name']}*: {status_emoji}\n"
-        msg += f"   Local: {local_time.strftime('%H:%M %Z')}\n\n"
-
+        status = "🟢 OPEN" if is_open else "🔴 CLOSED"
+        msg += f"{m['flag']} *{m['name']}*: {status}\n"
+        msg += f"   Local: {local.strftime('%H:%M %Z')}\n\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# ── Scheduler Setup ────────────────────────────────────────────────────────────
-def setup_scheduler(scheduler: AsyncIOScheduler, bot: Bot):
-
-    # Good Morning — 6:00 AM New York time
-    scheduler.add_job(good_morning, "cron", hour=6, minute=0,
-                      timezone=TZ_NY, args=[bot])
-
-    # Tokyo open/close (JST)
-    scheduler.add_job(market_open_alert,  "cron", hour=9,  minute=0,  timezone=TZ_TOKYO,  args=[bot, "tokyo"])
-    scheduler.add_job(market_close_alert, "cron", hour=15, minute=30, timezone=TZ_TOKYO,  args=[bot, "tokyo"])
-
-    # London open/close (GMT)
-    scheduler.add_job(market_open_alert,  "cron", hour=8,  minute=0,  timezone=TZ_LONDON, args=[bot, "london"])
-    scheduler.add_job(market_close_alert, "cron", hour=16, minute=30, timezone=TZ_LONDON, args=[bot, "london"])
-
-    # New York open/close (EST)
-    scheduler.add_job(market_open_alert,  "cron", hour=9,  minute=30, timezone=TZ_NY,     args=[bot, "newyork"])
-    scheduler.add_job(market_close_alert, "cron", hour=16, minute=0,  timezone=TZ_NY,     args=[bot, "newyork"])
-
-    # Bullish/Bearish signals — every 2 hours during NY trading hours
-    scheduler.add_job(bullish_bearish_signal, "cron", hour="10,12,14,16",
-                      minute=0, timezone=TZ_NY, args=[bot])
-
-    # Breaking news — every 3 hours
-    scheduler.add_job(breaking_news, "cron", hour="7,10,13,16",
-                      minute=0, timezone=TZ_NY, args=[bot])
-
-    # High impact events reminder — every weekday at 8:00 AM NY
-    scheduler.add_job(high_impact_events, "cron", hour=8, minute=0,
-                      day_of_week="mon-fri", timezone=TZ_NY, args=[bot])
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
-async def main():
+
+def main():
+    global _bot
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    bot = app.bot
+    _bot = app.bot
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
 
-    scheduler = AsyncIOScheduler()
-    setup_scheduler(scheduler, bot)
+    # Use BackgroundScheduler (no asyncio conflict)
+    scheduler = BackgroundScheduler(timezone=TZ_UTC)
+
+    # Good Morning 6AM NY
+    scheduler.add_job(job_good_morning, "cron", hour=11, minute=0)  # 6AM NY = 11AM UTC
+
+    # Tokyo
+    scheduler.add_job(job_market_open,  "cron", hour=0,  minute=0,  args=["tokyo"])   # 9AM JST = 0AM UTC
+    scheduler.add_job(job_market_close, "cron", hour=6,  minute=30, args=["tokyo"])   # 3:30PM JST = 6:30AM UTC
+
+    # London
+    scheduler.add_job(job_market_open,  "cron", hour=8,  minute=0,  args=["london"])  # 8AM GMT = 8AM UTC
+    scheduler.add_job(job_market_close, "cron", hour=16, minute=30, args=["london"])  # 4:30PM GMT = 4:30PM UTC
+
+    # New York
+    scheduler.add_job(job_market_open,  "cron", hour=14, minute=30, args=["newyork"]) # 9:30AM EST = 2:30PM UTC
+    scheduler.add_job(job_market_close, "cron", hour=21, minute=0,  args=["newyork"]) # 4PM EST = 9PM UTC
+
+    # Signals every 2 hours during NY trading
+    scheduler.add_job(job_signals, "cron", hour="15,17,19,21", minute=0)
+
+    # News every 3 hours
+    scheduler.add_job(job_news, "cron", hour="8,11,14,17", minute=0)
+
+    # Events weekdays 8AM NY = 1PM UTC
+    scheduler.add_job(job_events, "cron", day_of_week="mon-fri", hour=13, minute=0)
+
     scheduler.start()
-
     logger.info("🚀 AZZAM & Co Trading Bot is running!")
-    await app.run_polling()
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
