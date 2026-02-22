@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime
 import pytz
 import aiohttp
@@ -278,4 +279,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
